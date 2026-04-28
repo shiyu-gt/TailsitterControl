@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 python aircraft_6dof.py)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

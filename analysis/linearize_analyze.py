@@ -10,11 +10,11 @@
 然后对每个子系统进行特征值/模态分析。
 
 使用方法：
-    python linearize_analyze.py
+    python -m analysis.linearize_analyze
 """
 
 import numpy as np
-from aircraft_6dof import Aircraft6DOF, isa_atmosphere
+from core import Aircraft6DOF, isa_atmosphere
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

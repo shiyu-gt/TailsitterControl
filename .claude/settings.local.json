@@ -1,8 +1,24 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PYTHONIOENCODING=utf-8 python aircraft_6dof.py)",
-      "Bash(python -c ' *)"
+      "Bash(PYTHONIOENCODING=utf-8 python core/aircraft_6dof.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m simulations.*)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m tests.*)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m analysis.*)",
+      "Bash(python -c ' *)",
+      "Bash(ls *)",
+      "Bash(git *)",
+      "Bash(wc *)",
+      "Bash(python -c \"from core import Aircraft6DOF, integrate_6dof_quaternion; ac = Aircraft6DOF\\(\\); print\\('core OK'\\)\")",
+      "Bash(python -c \"from controllers import HoverPID, ForwardController, RecoveryController; print\\('controllers OK'\\)\")",
+      "Bash(python -c \"from simulations.hover_simulation import run_hover_simulation; print\\('hover_simulation OK'\\)\")",
+      "Bash(python -c \"from simulations.transition_simulation import run_transition_simulation; print\\('transition_simulation OK'\\)\")",
+      "Bash(python -c \"from simulations.recovery_simulation import run_recovery_simulation; print\\('recovery_simulation OK'\\)\")",
+      "Bash(python -c \"from tests.test_polarity import run_test; print\\('test_polarity OK'\\)\")",
+      "Bash(python -c \"from tests.test_forward_controller import test_case; print\\('test_forward_controller OK'\\)\")",
+      "Bash(python -c \"from tests.test_forward_flight import main; print\\('test_forward_flight OK'\\)\")",
+      "Bash(python -c \"from analysis.linearize_analyze import full_linearisation; print\\('linearize_analyze OK'\\)\")",
+      "Bash(python -c \"from analysis.hover_trim_manual import manual_hover_trim; print\\('hover_trim_manual OK'\\)\")"
     ]
   }
 }

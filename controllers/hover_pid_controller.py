@@ -10,7 +10,7 @@
 """
 
 import numpy as np
-from aircraft_6dof import euler_to_quaternion, quaternion_multiply, rotation_matrix_from_quaternion
+from core import euler_to_quaternion, quaternion_multiply, rotation_matrix_from_quaternion
 
 
 class HoverPID:

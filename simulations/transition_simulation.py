@@ -9,12 +9,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-from aircraft_6dof import (
+from core import (
     Aircraft6DOF, quaternion_to_euler, euler_to_quaternion,
-    quaternion_multiply, isa_atmosphere
+    quaternion_multiply, isa_atmosphere, integrate_6dof_quaternion
 )
-from hover_pid_controller import HoverPID
-from forward_controller import ForwardController
+from controllers import HoverPID, ForwardController, RecoveryController
 
 
 def setup_chinese_font():
@@ -25,6 +24,14 @@ def setup_chinese_font():
 class TransitionController:
     def __init__(self, ac):
         self.ac = ac
+
+        # 任务参数（必须在 RecoveryController 之前定义）
+        self.t_transition = 20.0
+        self.t_cruise = 10.0
+        self.t_transition_rec = 15.0
+        self.V_cruise = 20.0
+        self.h_hover = 20.0
+        self.h_cruise = 50.0
 
         # 悬停配平
         self.x_hover, self.u_hover, _, self.hover_theta, _ = ac.trim(V_trim=0.0, h_trim=0.0)
@@ -38,20 +45,19 @@ class TransitionController:
         self.pid = HoverPID()
         self.pid.hover_throttle = self.hover_throttle
         self.pid.max_de = np.radians(30)
-        self.pid.max_desired_rate = np.radians(360)  # 过渡阶段需要更大角速度指令以充分利用舵面
+        self.pid.max_desired_rate = np.radians(360)
         self.pid.reset()
 
         # 前飞控制律
         self.forward = ForwardController(self.cruise_theta, self.cruise_throttle)
         self.forward.reset(theta_trim=self.cruise_theta)
 
-        # 任务参数
-        self.t_transition = 20.0   # 延长前过渡期以降低姿态变化率
-        self.t_cruise = 10.0
-        self.t_transition_rec = 15.0
-        self.V_cruise = 20.0
-        self.h_hover = 20.0
-        self.h_cruise = 50.0
+        # 回收控制律
+        self.recovery = RecoveryController(
+            self.cruise_theta, self.cruise_throttle, self.hover_throttle,
+            V_cruise=self.V_cruise, h_cruise=self.h_cruise,
+            h_hover=self.h_hover, t_rec=self.t_transition_rec
+        )
 
         # 混合窗口
         self.V_hover_blend = 5.0
@@ -61,9 +67,9 @@ class TransitionController:
         self.blend_low_threshold = 0.1
         self.blend_low_count = 0
 
-        # 期望姿态变化率限制（防止 SLERP 混合产生过大的姿态变化率）
+        # 期望姿态变化率限制
         self._q_blend_last = None
-        self.max_q_blend_rate = np.radians(3.0)  # 3°/s，更保守
+        self.max_q_blend_rate = np.radians(3.0)
 
     @staticmethod
     def _smooth_ramp(r):
@@ -95,11 +101,10 @@ class TransitionController:
 
         return V_des, z_des
 
-    def _compute_hover_outer(self, state, z_des):
+    def _compute_hover_outer(self, state, z_des, base_att_deg=60.0):
         """手动复现 HoverPID 外环，得到 q_hover_des 和 throttle_hover"""
         px, py, pz = state[10:13]
 
-        # 简化位置环（比例-only，无积分微分）
         pos_error_xy = -np.array([px, py])
         Kp_pos = self.pid.Kp_pos
         max_tilt = self.pid.max_tilt
@@ -112,12 +117,10 @@ class TransitionController:
         tilt_pitch = np.clip(-desired_accel_xy[0] / 9.81, -np.sin(max_tilt), np.sin(max_tilt))
 
         q_tilt = euler_to_quaternion(0.0, tilt_pitch, tilt_roll)
-        # 过渡阶段使用 60° 而非 90° 作为"悬停"基准姿态，避免从竖直急剧低头导致的力矩缺口
-        q_hover_base = euler_to_quaternion(0.0, np.radians(60.0), 0.0)
+        q_hover_base = euler_to_quaternion(0.0, np.radians(base_att_deg), 0.0)
         q_hover_des = quaternion_multiply(q_hover_base, q_tilt)
         q_hover_des = q_hover_des / np.linalg.norm(q_hover_des)
 
-        # 简化高度环（比例-only，限制修正幅度 ±0.2 防止过渡段满油门）
         h_err = pz - z_des
         throttle_hover = self.pid.hover_throttle + np.clip(0.02 * h_err, -0.2, 0.2)
         throttle_hover = np.clip(throttle_hover, 0.0, 1.0)
@@ -144,48 +147,79 @@ class TransitionController:
         return s0 * q1 + s1 * q2
 
     def compute(self, t, state, dt):
-        V_des, z_des = self.get_profile(t)
-
         u, v, w = state[0:3]
         V = np.sqrt(u**2 + v**2 + w**2)
         px, py, pz = state[10:13]
 
-        # ---- 混合系数 ----
-        # 前过渡期按时间混合（打破 V=0 死锁，让前飞律逐步介入产生低头指令）
-        # 巡航期完全前飞
-        # 回收期按空速混合，速度降低时自然回到悬停姿态
+        # ---- 阶段判断 ----
         t1 = self.t_transition
         t2 = t1 + self.t_cruise
         t3 = t2 + self.t_transition_rec
-        if t < t1:
-            blend = self._smooth_ramp(t / t1)
-        elif t < t2:
-            blend = 1.0
-        elif t < t3:
-            blend = (V - self.V_hover_blend) / (self.V_cruise_blend - self.V_hover_blend)
-            blend = np.clip(blend, 0.0, 1.0)
-        else:
-            blend = 0.0
+        in_recovery = (t >= t2) and (t < t3)
+        post_recovery = (t >= t3)
 
-        # ---- 悬停控制律外环 ----
-        q_hover_des, throttle_hover = self._compute_hover_outer(state, z_des)
+        if in_recovery:
+            t_rec = t - t2
+            V_des_rec, z_des_rec, stage = self.recovery.get_profile(t_rec, V)
 
-        # ---- 前飞控制律 ----
-        theta_fwd, phi_fwd, throttle_fwd = self.forward.compute(state, V_des, z_des, dt)
-        q_fwd_des = euler_to_quaternion(phi_fwd, theta_fwd, 0.0)
+            theta_rec, phi_rec, throttle_rec = self.recovery.compute(
+                state, V_des_rec, z_des_rec, dt, stage)
 
-        # ---- 混合 ----
-        if blend <= 0.0:
+            q_hover_des, throttle_hover = self._compute_hover_outer(state, z_des_rec, base_att_deg=90.0)
+
+            if stage == 'A':
+                blend_rec = 0.8
+            elif stage == 'B':
+                blend_rec = 0.5
+            else:
+                blend_rec = 0.2
+
+            q_rec_des = euler_to_quaternion(phi_rec, theta_rec, 0.0)
+
+            q_blend_target = self._slerp(q_hover_des, q_rec_des, blend_rec)
+            throttle_blend = (1.0 - blend_rec) * throttle_hover + blend_rec * throttle_rec
+            throttle_blend = np.clip(throttle_blend, self.recovery.throttle_floor, 1.0)
+
+            last_print = getattr(self, '_last_diag_t', -1.0)
+            if t - last_print >= 0.099:
+                self._last_diag_t = t
+                print(f"[REC] t={t:.1f} t_rec={t_rec:.1f} V={V:.1f} stage={stage} "
+                      f"theta_rec={np.degrees(theta_rec):.1f}° "
+                      f"thr_rec={throttle_rec:.3f} thr_hov={throttle_hover:.3f} "
+                      f"thr_out={throttle_blend:.3f} blend={blend_rec:.1f}")
+
+        elif post_recovery:
+            V_des, z_des = 0.0, self.h_hover
+            q_hover_des, throttle_hover = self._compute_hover_outer(state, z_des, base_att_deg=90.0)
             q_blend_target = q_hover_des
             throttle_blend = throttle_hover
-        elif blend >= 1.0:
-            q_blend_target = q_fwd_des
-            throttle_blend = throttle_fwd
+            blend_rec = 0.0
         else:
-            q_blend_target = self._slerp(q_hover_des, q_fwd_des, blend)
-            throttle_blend = (1.0 - blend) * throttle_hover + blend * throttle_fwd
+            V_des, z_des = self.get_profile(t)
 
-        # 限制期望姿态变化率，防止 SLERP 产生过大的姿态指令导致动力学失控
+            if t < t1:
+                blend = self._smooth_ramp(t / t1)
+            else:
+                blend = 1.0
+
+            q_hover_des, throttle_hover = self._compute_hover_outer(state, z_des, base_att_deg=60.0)
+
+            theta_fwd, phi_fwd, throttle_fwd = self.forward.compute(state, V_des, z_des, dt)
+            q_fwd_des = euler_to_quaternion(phi_fwd, theta_fwd, 0.0)
+
+            if blend <= 0.0:
+                q_blend_target = q_hover_des
+                throttle_blend = throttle_hover
+            elif blend >= 1.0:
+                q_blend_target = q_fwd_des
+                throttle_blend = throttle_fwd
+            else:
+                q_blend_target = self._slerp(q_hover_des, q_fwd_des, blend)
+                throttle_blend = (1.0 - blend) * throttle_hover + blend * throttle_fwd
+
+            blend_rec = blend
+
+        # 限制期望姿态变化率
         if self._q_blend_last is not None:
             dot = np.dot(self._q_blend_last, q_blend_target)
             if dot < 0:
@@ -224,7 +258,7 @@ class TransitionController:
         else:
             self.blend_low_count = 0
 
-        if self.blend_low_count >= 3:  # 持续至少 3 步（约 0.03s @ dt=0.01）
+        if self.blend_low_count >= 3:
             h_err = pz - z_des
             if self.pid.last_alt_error is not None and dt > 0:
                 alt_deriv = (h_err - self.pid.last_alt_error) / dt
@@ -236,7 +270,7 @@ class TransitionController:
                                - self.pid.Kp_alt * h_err
                                - self.pid.Kd_alt * alt_deriv) / self.pid.Ki_alt)
             else:
-                int_alt_eq = self.forward.int_alt  # Ki_alt=0 时直接复制前飞积分器
+                int_alt_eq = self.forward.int_alt
             self.pid.int_alt = int_alt_eq
 
         # ---- 末端悬停模式切换 ----
@@ -253,54 +287,6 @@ class TransitionController:
         return self.pid.compute(t, state, dt,
                                 q_desired_override=q_blend,
                                 throttle_override=throttle_blend)
-
-
-def integrate_6dof_quaternion(ac, x0, rho, control_func, t_span, dt=0.01):
-    steps = int((t_span[1] - t_span[0]) / dt) + 1
-    t = np.linspace(t_span[0], t_span[1], steps)
-    x = np.zeros((steps, 13))
-    u = np.zeros((steps, 4))
-
-    x[0] = x0
-    stop_idx = steps - 1
-
-    for i in range(1, steps):
-        if np.any(np.isnan(x[i - 1])) or np.any(np.abs(x[i - 1]) > 1e6):
-            print(f"警告: 在t={t[i-1]:.2f}s时状态溢出，停止仿真")
-            stop_idx = i - 1
-            break
-
-        u[i - 1] = control_func(t[i - 1], x[i - 1], dt)
-
-        try:
-            k1 = ac.derivatives(x[i - 1], u[i - 1], rho)
-            k2 = ac.derivatives(x[i - 1] + 0.5 * dt * k1, u[i - 1], rho)
-            k3 = ac.derivatives(x[i - 1] + 0.5 * dt * k2, u[i - 1], rho)
-            k4 = ac.derivatives(x[i - 1] + dt * k3, u[i - 1], rho)
-        except RuntimeError as e:
-            print(f"警告: 在t={t[i-1]:.2f}s时导数计算失败: {e}")
-            stop_idx = i - 1
-            break
-
-        if np.any(np.isnan(k1)) or np.any(np.abs(k1) > 1e6):
-            print(f"警告: 在t={t[i-1]:.2f}s时导数溢出，停止仿真")
-            stop_idx = i - 1
-            break
-
-        x[i] = x[i - 1] + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-        # 四元数归一化
-        q = x[i, 6:10]
-        q_norm = np.linalg.norm(q)
-        if q_norm > 1e-10:
-            x[i, 6:10] = q / q_norm
-
-    if stop_idx < steps - 1:
-        x[stop_idx + 1:, :] = x[stop_idx, :]
-        u[stop_idx:, :] = u[stop_idx - 1, :]
-
-    u[-1] = control_func(t[-1], x[-1], dt)
-    return t, x, u
 
 
 def run_transition_simulation(t_end=45.0, dt=0.01):

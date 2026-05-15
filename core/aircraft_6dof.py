@@ -22,6 +22,17 @@
 import os
 import numpy as np
 
+# ─── 数据目录解析 ────────────────────────────────────────────────
+
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+
+def _resolve_data_path(filename):
+    """解析数据文件路径，相对于 data/ 目录。"""
+    path = os.path.join(_DATA_DIR, filename)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"数据文件未找到: {path}")
+    return path
+
 # ─── 国际标准大气（简化，仅对流层） ────────────────────────────
 
 def isa_atmosphere(h):
@@ -136,10 +147,12 @@ class AeroModel:
             【兼容接口】供 legacy 代码调用，内部封装双动压模型
     """
 
-    def __init__(self, lon_file='aerodata_lon.xlsx',
-                 lat_file='aerodata_lat.xlsx',
-                 de_file='aerodata_de.xlsx',
-                 throttle_file='aerodata_throttle.xlsx'):
+    def __init__(self, lon_file=None, lat_file=None, de_file=None, throttle_file=None):
+        lon_file = lon_file or _resolve_data_path('aerodata_lon.xlsx')
+        lat_file = lat_file or _resolve_data_path('aerodata_lat.xlsx')
+        de_file = de_file or _resolve_data_path('aerodata_de.xlsx')
+        throttle_file = throttle_file or _resolve_data_path('aerodata_throttle.xlsx')
+
         # ── 几何参数（双旋翼飞翼式尾座式） ──
         self.S = 0.62        # 机翼参考面积 [m^2]
         self.c_bar = 0.31    # 平均气动弦长 [m]

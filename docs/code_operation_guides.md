@@ -1,4 +1,8 @@
-# 双旋翼尾座式固定翼飞机仿真代码操作指南
+# 尾座式无人机回收仿真 — 代码操作指南
+
+> 更新日期：2026-05-15
+
+---
 
 ## 1. 文件关系总览
 
@@ -12,165 +16,119 @@
     │              │              │                  │
     ▼              ▼              ▼                  ▼
 ┌─────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│hover_   │ │hover_        │ │hover_        │ │linearize_    │
-│pid_     │ │simulation.py │ │trim_manual.py│ │analyze.py    │
-│controller│ │（悬停仿真主  │ │（手动配平    │ │（固定翼模态  │
-│.py      │ │ 程序）       │ │ 验证）       │ │ 分析）       │
-│（控制器）│ │              │ │              │ │              │
-└─────────┘ └──────────────┘ └──────────────┘ └──────────────┘
-
-新增调试脚本：
-- `test_compute_polarity.py`：极性验证
-- `hover_single_channel_debug.py`：阶段二单通道独立调试
-- `hover_joint_debug.py`：阶段三联合调试与扰动测试
+│hover_   │ │recovery_     │ │hover_        │ │linearize_    │
+│pid_     │ │simulation.py │ │simulation.py │ │analyze.py    │
+│controller│ │（回收仿真    │ │（悬停仿真    │ │（模态分析）  │
+│.py      │ │ 主程序）     │ │）            │ │              │
+│（悬停PID）│ │              │ │              │ │              │
+└────┬────┘ └──────┬───────┘ └──────────────┘ └──────────────┘
+     │             │
+     │    ┌────────┴────────┐
+     │    │                 │
+     │    ▼                 ▼
+     │ ┌──────────────┐ ┌──────────────┐
+     │ │recovery_     │ │recovery_     │
+     │ │controller.py │ │envelope.py   │
+     │ │（回收控制律） │ │（包络线分析）│
+     │ └──────────────┘ └──────────────┘
+     │         │
+     └─────────┘
+     （HoverPID 作为内环被 RecoveryController 调用）
 ```
 
 ### 各文件职责
 
 | 文件 | 职责 | 依赖关系 |
-|------|------|----------|
-| `aircraft_6dof.py` | 核心动力学模型：ISA大气、四元数运算、气动插值、6DOF状态导数、配平求解、双动压气动力计算 | 无（被所有其他文件导入） |
-| `hover_pid_controller.py` | 悬停PID控制器：外环位置→中环姿态（四元数误差→旋转矢量）→内环角速度→控制分配 | `aircraft_6dof.py`（四元数工具函数） |
-| `hover_simulation.py` | 悬停仿真主程序：RK4四元数积分器、结果绘图与性能评估 | `aircraft_6dof.py`, `hover_pid_controller.py` |
-| `hover_trim_manual.py` | 手动构造悬停配平状态（theta=90°），验证零状态导数 | `aircraft_6dof.py` |
-| `linearize_analyze.py` | 固定翼前飞模态分析：数值雅可比、纵向/横航向解耦、特征值分析 | `aircraft_6dof.py` |
-| `test_compute_polarity.py` | 控制器极性验证：隔离测试俯仰/滚转/偏航/位置/高度各通道响应方向 | `aircraft_6dof.py`, `hover_pid_controller.py` |
+|------|------|---------|
+| `core/aircraft_6dof.py` | 6DOF 动力学、气动模型、配平求解、ISA 大气 | 无 |
+| `core/integrator.py` | RK4 积分器（四元数归一化） | aircraft_6dof |
+| `controllers/hover_pid_controller.py` | 四环级联悬停 PID | aircraft_6dof |
+| `controllers/recovery_controller.py` | 三阶段回收控制律 | 无（纯控制逻辑） |
+| `simulations/recovery_simulation.py` | 回收段独立仿真 | 全部核心+控制器 |
+| `simulations/hover_simulation.py` | 悬停仿真 | aircraft_6dof, hover_pid |
+| `analysis/recovery_envelope.py` | 减速能力包络线分析 | aircraft_6dof |
+| `analysis/linearize_analyze.py` | 线性化与模态分析 | aircraft_6dof |
+| `tests/test_polarity.py` | 控制极性验证 | aircraft_6dof, hover_pid |
 
 ---
 
 ## 2. 当前代码状态
 
-### 2.1 aircraft_6dof.py（核心模型）
-
-**已实现功能：**
-- 基于Excel表格插值的非线性气动模型（纵向/横侧向/升降副翼增量/油门推力）
-- **双动压气动力模型**：基础气动使用自由流动压 `q_inf`，舵面气动（位于螺旋桨滑流中）使用滑流动压 `q_slip`
-- 动量理论滑流速度计算（使用真实空速 `V_inf = sqrt(u²+v²+w²)`，非硬编码常量）
-- 13状态6DOF方程（含四元数姿态），欧拉积分 + RK4积分器
-- 牛顿-拉夫逊配平求解器
-- 统一4维控制输入：`[throttle_left, throttle_right, de_left, de_right]`（升降副翼布局，无独立副翼/方向舵）
-- 差动油门力矩分配至 **N（偏航力矩）**，物理正确
-
-**待改进项：**
-1. `linearize_analyze.py` 适配：当前线性化脚本仍假设12状态（欧拉角），需适配13状态四元数系统或在 `aircraft_6dof.py` 中新增12状态包装接口。
-
-### 2.2 hover_pid_controller.py（悬停控制器）
-
-**已实现功能：**
-- 四级级联PID：位置外环(x,y) → 高度控制(z) → 四元数姿态中环 → 角速度内环
-- 四元数误差直接映射为旋转矢量，天然无万向锁
-- 输出限幅已恢复：`max_tilt=15°`，`max_de=20°`，`max_desired_rate=60°/s`
-- 控制分配极性已修正：
-  - `pitch_to_elevator = +0.08`（飞翼布局 `Cm_de > 0`，后仰时上偏产生低头恢复力矩）
-  - `yaw_to_throttle_diff = +0.02`（正偏航误差 → 左油门增大 → 负偏航力矩回正）
-- `reset()` 正确清零所有积分器与滤波器状态（含 `last_pos_deriv_xy`、`last_att_deriv`、`last_rate_deriv`）
-- 阶段二临时单通道隔离代码（`debug_channel`）已移除，恢复全通道耦合
-
-**当前参数（阶段三整定后）：**
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `Kp_pos` | 0.80 | 位置比例增益 |
-| `Ki_pos` | 0.10 | 位置积分增益 |
-| `Kd_pos` | 0.60 | 位置微分增益（速度阻尼） |
-| `Kp_alt` | 0.065 | 高度比例增益 |
-| `Kd_alt` | 0.14 | 高度微分增益 |
-| `Kp_att` | 8.0 | 姿态比例增益 |
-| `Kp_rate` | 1.5 | 角速度比例增益 |
-| `Kd_rate` | 0.05 | 角速度微分增益 |
-
-### 2.3 hover_simulation.py（悬停仿真）
-
-**已实现功能：**
-- RK4积分器（每步后重新归一化四元数）
-- 绘制位置、速度、姿态、3D轨迹、控制量、误差曲线
-- 扰动注入代码已注释（阶段一验证无扰动稳定性）
-
-**待改进项：**
-1. 扰动注入方式：当前直接修改状态向量的方式非物理，建议后续改为力/力矩脉冲或持续风场。
-
-### 2.4 hover_trim_manual.py（手动配平）
-
-**状态：** 已修正。`theta = np.radians(90.0)`，机头朝上尾座式悬停。配平残差 `max|dx[0:9]| < 1e-3`。
-
-### 2.5 linearize_analyze.py（模态分析）
-
-**状态：** 当前以 `V_trim=20 m/s` 为默认工况，但状态索引假设仍为12状态（欧拉角）系统。与13状态四元数模型不直接兼容。
-
-**建议方案：**
-- 方案A：保留13状态四元数模型，增加一个包装函数 `derivatives_12state(x_12, u, rho)`，将欧拉角转换为四元数后调用原模型，再对12状态系统线性化。
-- 方案B：在 `aircraft_6dof.py` 中新增一个12状态（欧拉角）的导数接口，专用于线性化分析。
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| `core/aircraft_6dof.py` | 稳定 | 6DOF + 配平 + 气动查表，已验证 |
+| `core/integrator.py` | 稳定 | RK4 + 四元数归一化，已验证 |
+| `controllers/hover_pid_controller.py` | 稳定 | 四环级联 PID，悬停验证通过 |
+| `controllers/recovery_controller.py` | **开发中** | Stage A 验证通过，Stage B 待优化 |
+| `simulations/recovery_simulation.py` | 稳定 | 含诊断记录和图表生成 |
+| `analysis/recovery_envelope.py` | 稳定 | 配平扫描和减速包络线 |
 
 ---
 
-## 3. 验证清单
+## 3. 验证检查清单
 
-以下验证项基于当前代码状态，运行前应确认 `aircraft_6dof.py` 与 `hover_pid_controller.py` 已同步更新。
+### 3.1 基础验证
 
-| 验证项 | 命令 | 期望结果 |
-|--------|------|----------|
-| 配平残差 | `python hover_trim_manual.py` | `max\|dx[0:9]\| < 1e-3` |
-| 极性验证 | `python test_compute_polarity.py` | 全部通道 `[OK]` |
-| 单通道调试 | `python hover_single_channel_debug.py` | 四通道均判定"通过" |
-| 联合调试 | `python hover_joint_debug.py` | 5项测试均判定"通过" |
-| 悬停稳定性 | `python hover_simulation.py` | 20s内位置误差收敛至 `<0.5m`（无扰动从配平点启动） |
-| 四元数归一化 | 检查仿真输出 `norm(q)` | 全程保持 `1.0 ± 1e-6` |
-| 前飞模态 | `python linearize_analyze.py` | 识别出短周期、长周期、荷兰滚等经典模态（**注意**：当前脚本与13状态系统不完全兼容，结果仅供参考） |
+- [ ] `python -m tests.test_polarity` — 极性验证通过
+- [ ] `python -m simulations.hover_simulation` — 悬停稳定
+- [ ] `python -m analysis.linearize_analyze` — 模态分析正常
 
----
+### 3.2 回收仿真验证
 
-## 4. 已完成阶段总结
-
-### 阶段一：极性验证与无扰动稳定性（已完成）
-
-- 控制分配符号修正：`pitch_to_elevator = +0.08`，`yaw_to_throttle_diff = +0.02`
-- `reset()` 修复：正确清零滤波器状态
-- 输出限幅恢复：`max_de=20°` 已在 `compute()` 中生效
-- 20s无扰动仿真：位置误差保持 `<0.01m`
-
-### 阶段二：单通道独立调试（已完成）
-
-| 通道 | 初始偏差 | 超调 | 稳定时间 | 峰值控制量 | 判定 |
-|------|---------|------|---------|-----------|------|
-| 俯仰 | 1° | 0.0% | 0.88s | 0.96° | 通过 |
-| 滚转 | 5° | 1.7% | 0.38s | 1.20° | 通过 |
-| 偏航 | 10° | 49.7% | 4.29s | 0.031油门差 | 通过 |
-| 高度 | 1m | 0.0% | 7.60s | 0.699油门 | 通过 |
-
-关键调参：
-- `Kp_att`: 2.0 → **8.0**
-- `Kp_rate`: 0.5 → **1.5**
-- `Kp_alt`: 0.08 → **0.065**
-- `Kd_alt`: 0.15 → **0.14**
-
-### 阶段三：联合调试与扰动测试（已完成）
-
-| 测试 | 初始条件 | 稳定时间 | 最终误差 | 最大舵面 | 油门波动 | 判定 |
-|------|---------|---------|---------|---------|---------|------|
-| 1 水平耦合 | px=+0.5, py=+0.5 | 1.2s | ≈0m | 2.3° | ±0.014 | 通过 |
-| 2 水平+高度 | px=+0.5, pz=+1.0 | 1.7s | ≈0m | 2.2° | ±0.065 | 通过 |
-| 3 全状态 | px=+1, py=+1, pz=+1, yaw=+5° | 4.8s | ≈0m | 5.9° | ±0.084 | 通过 |
-| 4 大偏差 | px=+5, py=-3 | 8.9s | ≈0m | 7.6° | ±0.069 | 通过 |
-| 5 姿态+位置 | roll=+5°, px=+2 | 4.8s | ≈0m | 8.4° | ±0.023 | 通过 |
-
-关键调参：位置环引入 PI + 速度阻尼
-- `Kp_pos`: 0.05 → **0.80**
-- `Ki_pos`: 0.0 → **0.10**
-- `Kd_pos`: 0.0 → **0.60**
+- [ ] Stage A：V 从 20 降至 ~15 m/s，alpha < 20°，无振荡
+- [ ] Stage B：进入后 V 持续下降（非停滞）
+- [ ] Stage C：theta 平滑过渡到 ~85°，V 降至 < 1 m/s
+- [ ] 终点：V < 1 m/s，pz 在 20±2 m
+- [ ] 全程：alpha < 25°，无舵面持续饱和
 
 ---
 
-## 5. 下一步工作建议
+## 4. 调试操作
 
-### 阶段四：模型与功能扩展
+### 4.1 添加诊断打印
 
-1. **过渡飞行仿真（Transition）**：新增 `transition_simulation.py`，研究悬停↔前飞的姿态/油门协调控制
-2. **悬停状态线性化**：新增 `hover_linearize.py`，在 `theta=90°` 配平点进行13状态线性化，分析悬停模态
-3. **线性化脚本适配**：修正 `linearize_analyze.py` 的状态索引，或新增12状态包装接口
-4. **数据导出与可视化**：导出时序数据为 `.csv`/`.mat`，增加3D轨迹动画
-5. **风扰测试**：引入持续风场或阵风模型，评估悬停抗风能力
+在 `recovery_simulation.py` 的 `control()` 函数中：
 
+```python
+# 每 1 秒打印一次
+if abs(t - round(t)) < dt/2:
+    print(f"t={t:.1f} stage={stage} V={V:.1f} V_des={V_des:.1f} "
+          f"theta={np.degrees(theta_des):.1f}° thr={throttle_des:.3f}")
+```
+
+### 4.2 检查力矩平衡
+
+在仿真循环中插入：
+
+```python
+alpha = np.arctan2(state[2], state[0])
+q_inf = 0.5 * rho * V**2
+Cm = np.interp(np.degrees(alpha), ac.aero._lon_alpha, ac.aero._lon_Cm)
+M_aero = Cm * q_inf * ac.aero.S * ac.aero.c_bar
+print(f"alpha={np.degrees(alpha):.1f}° M_aero={M_aero:+.3f} N·m")
+```
+
+### 4.3 修改参数后清理缓存
+
+```bash
+find . -name "*.pyc" -delete
+find . -name "__pycache__" -type d -exec rm -rf {} +
+```
 
 ---
 
-*本指南基于2026-04-26的代码快照编写。*
+## 5. 关键接口
+
+```python
+# RecoveryController 接口
+rec_ctrl = RecoveryController(cruise_theta, cruise_throttle, hover_throttle,
+                               V_cruise, h_cruise, h_hover, t_rec)
+V_des, z_des, stage = rec_ctrl.get_profile(t_rec, V_current, pz=pz)
+theta_des, phi_des, throttle_des = rec_ctrl.compute(state, V_des, z_des, dt, stage)
+de_override = rec_ctrl._de_override  # Stage B 时非 None
+
+# HoverPID 接口
+u_out = pid.compute(t, state, dt,
+                    q_desired_override=q_des,
+                    throttle_override=throttle_des)
+```

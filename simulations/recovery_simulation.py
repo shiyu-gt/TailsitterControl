@@ -17,7 +17,7 @@ from core import (
 from controllers import HoverPID, RecoveryController
 
 
-def run_recovery_simulation(dt=0.01, t_end=60.0):
+def run_recovery_simulation(dt=0.01, t_end=150.0):
     """直接从巡航配平状态开始的回收仿真"""
     plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
@@ -47,7 +47,7 @@ def run_recovery_simulation(dt=0.01, t_end=60.0):
 
     # ── 创建控制器 ──
     rec_ctrl = RecoveryController(theta_c, cruise_throttle, hover_throttle,
-                                   V_cruise, h_cruise, h_hover, t_rec=t_end)
+                                   V_cruise, h_cruise, h_hover, t_rec=120.0)
     pid = HoverPID()
     pid.hover_throttle = hover_throttle
     pid.max_de = np.radians(30)
@@ -61,29 +61,49 @@ def run_recovery_simulation(dt=0.01, t_end=60.0):
         'theta_base': [], 'gamma_des': [],
         'throttle_base': [], 'throttle_rec': [],
         'h_err': [], 'vel_err': [],
+        'alpha_deg': [], 'alpha_prot_active': [],
+        'int_vel': [], 'V_actual': [],
     }
 
     def control(t, state, dt_step):
         V = np.sqrt(state[0]**2 + state[1]**2 + state[2]**2)
-        V_des, z_des, stage = rec_ctrl.get_profile(t, V)
+        V_des, z_des, stage = rec_ctrl.get_profile(t, V, pz=state[12])
 
         theta_des, phi_des, throttle_des = rec_ctrl.compute(state, V_des, z_des, dt_step, stage)
 
-        q_des = euler_to_quaternion(phi_des, theta_des, 0.0)
+        de_override = getattr(rec_ctrl, '_de_override', None)
 
-        pid.target_pos[2] = z_des
-        u_out = pid.compute(t, state, dt_step,
-                            q_desired_override=q_des,
-                            throttle_override=throttle_des)
+        if de_override is not None:
+            # Stage B: 直接控制升降副翼，绕过 HoverPID 姿态环
+            de_left = de_override
+            de_right = de_override
+            u_out = np.array([throttle_des, throttle_des, de_left, de_right])
+        else:
+            q_des = euler_to_quaternion(phi_des, theta_des, 0.0)
+            pid.target_pos[2] = z_des
+            u_out = pid.compute(t, state, dt_step,
+                                q_desired_override=q_des,
+                                throttle_override=throttle_des)
 
         # 记录诊断量
         pz = state[12]
+        alpha = np.degrees(np.arctan2(state[2], state[0]))
+        if len(diag['V_des']) == 0:  # 第一次调用
+            import sys
+            print(f"DEBUG sim: throttle_des={throttle_des:.4f} stage={stage}", file=sys.stderr, flush=True)
         diag['V_des'].append(V_des)
         diag['z_des'].append(z_des)
         diag['stage'].append(stage)
         diag['throttle_rec'].append(throttle_des)
         diag['h_err'].append(pz - z_des)
         diag['vel_err'].append(V - V_des)
+        diag['alpha_deg'].append(alpha)
+        diag['alpha_prot_active'].append(rec_ctrl._last_alpha_prot_active)
+        diag['theta_base'].append(np.degrees(rec_ctrl._last_theta_base))
+        diag['gamma_des'].append(np.degrees(rec_ctrl._last_gamma_des))
+        diag['throttle_base'].append(rec_ctrl._last_throttle_base)
+        diag['int_vel'].append(rec_ctrl.int_vel)
+        diag['V_actual'].append(V)
 
         return u_out
 
@@ -183,6 +203,35 @@ def run_recovery_simulation(dt=0.01, t_end=60.0):
               f"{thr_left[i]:6.3f} {thr_right[i]:6.3f} "
               f"{de_left[i]:6.1f} {de_right[i]:6.1f} {h_err:6.1f}")
 
+    # ── 诊断统计 ──
+    alpha_prot_arr = np.array(diag['alpha_prot_active'])
+    int_vel_arr = np.array(diag['int_vel'])
+    V_actual_arr = np.array(diag['V_actual'])
+    gamma_des_arr = np.array(diag['gamma_des'])
+    theta_base_arr = np.array(diag['theta_base'])
+    throttle_base_arr = np.array(diag['throttle_base'])
+
+    prot_count = np.sum(alpha_prot_arr)
+    prot_duration = prot_count * dt
+    int_vel_peak = np.max(np.abs(int_vel_arr))
+
+    # 各阶段平均减速率
+    print("\n" + "-" * 50)
+    print("  诊断统计")
+    print("-" * 50)
+    print(f"Alpha 保护触发次数: {prot_count}")
+    print(f"Alpha 保护累计时间: {prot_duration:.2f}s")
+    print(f"积分器 int_vel 峰值: {int_vel_peak:.4f}")
+    for stg in ['A', 'B', 'C']:
+        mask = np.array(stage_arr) == stg
+        if np.any(mask):
+            idxs = np.where(mask)[0]
+            if len(idxs) > 1:
+                dV = V_actual_arr[idxs[-1]] - V_actual_arr[idxs[0]]
+                dt_stg = t[idxs[-1]] - t[idxs[0]]
+                avg_decel = -dV / dt_stg if dt_stg > 0 else 0
+                print(f"Stage {stg} 平均减速率: {avg_decel:.3f} m/s²")
+
     # ── 作图 ──
     fig, axes = plt.subplots(3, 3, figsize=(18, 16))
 
@@ -252,9 +301,47 @@ def run_recovery_simulation(dt=0.01, t_end=60.0):
     fig2.savefig('recovery_trajectory.png', dpi=150, bbox_inches='tight')
     plt.close(fig2)
 
-    print("\n图表已保存: recovery_result.png, recovery_trajectory.png")
+    # 诊断图
+    fig3, axes3 = plt.subplots(2, 2, figsize=(14, 10))
+
+    t_diag = t[:len(alpha_prot_arr)]
+
+    ax = axes3[0, 0]
+    ax.plot(t_diag, np.array(diag['alpha_deg']), 'b-', lw=1.2, label='迎角')
+    prot_mask = alpha_prot_arr.astype(bool)
+    if np.any(prot_mask):
+        ax.fill_between(t_diag, 0, np.array(diag['alpha_deg']),
+                        where=prot_mask, alpha=0.3, color='red', label='保护区')
+    ax.axhline(rec_ctrl.alpha_warn, color='orange', ls='--', alpha=0.7, label=f'warn={np.degrees(rec_ctrl.alpha_warn):.0f}°')
+    ax.axhline(rec_ctrl.alpha_max, color='red', ls='--', alpha=0.7, label=f'max={np.degrees(rec_ctrl.alpha_max):.0f}°')
+    ax.set_ylabel('迎角 (deg)'); ax.set_title('迎角与保护触发'); ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes3[0, 1]
+    ax.plot(t_diag, gamma_des_arr, 'b-', lw=1.2, label='gamma_des')
+    ax.plot(t_diag, theta_base_arr, 'g--', lw=1.0, alpha=0.7, label='theta_base')
+    ax.set_ylabel('角度 (deg)'); ax.set_title('速度环输出 gamma_des'); ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes3[1, 0]
+    ax.plot(t_diag, int_vel_arr, 'b-', lw=1.2)
+    ax.axhline(rec_ctrl.max_int_vel, color='r', ls='--', alpha=0.5, label='积分限幅')
+    ax.axhline(-rec_ctrl.max_int_vel, color='r', ls='--', alpha=0.5)
+    ax.set_ylabel('int_vel'); ax.set_xlabel('时间 (s)'); ax.set_title('速度积分器'); ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes3[1, 1]
+    # 瞬时减速度
+    dV_dt = np.diff(V_actual_arr) / dt
+    ax.plot(V_actual_arr[:-1], dV_dt, 'b.', ms=1, alpha=0.3)
+    ax.axhline(0, color='k', ls=':', alpha=0.3)
+    ax.set_xlabel('空速 (m/s)'); ax.set_ylabel('加速度 (m/s²)'); ax.set_title('减速度 vs 速度'); ax.grid(True)
+
+    fig3.suptitle('回收诊断', fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig3.savefig('recovery_diag.png', dpi=150, bbox_inches='tight')
+    plt.close(fig3)
+
+    print("\n图表已保存: recovery_result.png, recovery_trajectory.png, recovery_diag.png")
     return t, x_hist, u_hist
 
 
 if __name__ == "__main__":
-    run_recovery_simulation(dt=0.01, t_end=60.0)
+    run_recovery_simulation(dt=0.01, t_end=150.0)

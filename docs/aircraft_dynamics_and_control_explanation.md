@@ -7,6 +7,7 @@
 - 考虑螺旋桨滑流效应的控制面效能增强（双动压模型）
 - 四元数姿态表示，避免尾座式悬停时的万向锁（theta≈90°）
 - 级联PID控制器用于悬停控制（位置→姿态→角速度）
+- 三阶段回收控制律（RecoveryController）用于巡航→悬停过渡
 - 线性化分析与模态分析
 
 ---
@@ -365,9 +366,82 @@ T_{right} &= T + \Delta T_{diff}
 
 ---
 
-## 5. 线性化分析
+## 5. 回收控制律设计（RecoveryController）
 
-### 5.1 数值雅可比计算
+### 5.1 三阶段策略概述
+
+回收控制律负责将飞机从巡航状态（V≈20 m/s, theta≈5°）过渡到悬停状态（V≈0, theta≈90°）。由于飞机在中等迎角下的减速能力有限（约 0.1 m/s²），且高迎角时存在力矩不平衡硬约束，采用分阶段策略：
+
+| 阶段 | 速度范围 | 策略 | 控制方式 |
+|------|---------|------|---------|
+| Stage A | V > 12 m/s | 低油门重力减速 | 速度环→gamma修正，HoverPID内环 |
+| Stage B | 3 < V < 12 m/s | alpha指令抬头减速 | 直接升降副翼P控制（绕过HoverPID） |
+| Stage C | V < 3 m/s | 建立悬停 | HoverPID全权控制 |
+
+阶段切换带迟滞：一旦进入 B/C 不退回 A。额外触发条件：时间用完 80% 或高度下降超过 15m。
+
+### 5.2 Stage A — 低油门减速
+
+巡航状态下油门约为 0.057。Stage A 将油门降至 0.03（远低于巡航值），使推力小于阻力，靠重力分量辅助减速。
+
+$$\theta_{base} = \theta_{cruise} \approx 5°$$
+$$V_{des} = V_{cruise} + (12.5 - V_{cruise}) \cdot \min(t_{rec}/50, 1)$$
+$$\theta_{des} = \theta_{base} + \gamma_{des}$$
+
+其中 $\gamma_{des}$ 由速度环 PID 产生，限幅 $\pm 20°$。
+
+**油门修正**：只允许减小（$\Delta T \leq 0$），不增加推力，防止爬升失控。
+
+**Alpha 保护**：当 $\alpha > 20°$ 时冻结速度积分器，smoothstep 渐变限制抬头：
+
+$$\text{fade} = 3x^2 - 2x^3, \quad x = \frac{\alpha - \alpha_{warn}}{\alpha_{max} - \alpha_{warn}}$$
+$$\gamma_{floor} = -\gamma_{max} \cdot \text{fade}$$
+
+$\alpha = 20°$ 时 fade=0（无强制），$\alpha = 25°$ 时 fade=1（全力低头）。迟滞恢复：$\alpha < 18°$ 时解冻积分器。
+
+### 5.3 Stage B — Alpha 指令减速
+
+Stage B 的核心思路：**让飞机在低油门下以中等迎角飞行，利用阻力减速**。
+
+**俯仰控制**：直接基于速度设定迎角目标，不经过速度环：
+
+$$\alpha_{target} = 18° + \frac{12 - V}{12 - 3} \cdot (8° - 18°)$$
+
+高速（V≈12）时目标 18°（大阻力），低速（V≈3）时目标 8°（准备过渡到 Stage C）。假设航迹角 $\gamma \approx 0$，则 $\theta_{base} = \alpha_{target}$。
+
+**速度环禁用**：$K_p^{vel} = K_i^{vel} = K_d^{vel} = 0$，$\gamma_{max} = 0$。俯仰完全由 alpha 目标驱动。
+
+**直接升降副翼控制**：绕过 HoverPID 的姿态→角速度级联，P 控制器直接输出升降副翼偏角：
+
+$$\theta_{err} = \theta_{des} - \theta_{current}$$
+$$\delta e_{sym} = K_p^{elevon} \cdot \theta_{err}, \quad K_p^{elevon} = 10.0, \quad |\delta e_{sym}| \leq 30°$$
+
+**油门**：从 0.03 渐变到 hover_throttle，上限为 cruise_throttle，确保净推力不产生加速。
+
+### 5.4 Stage C — 建立悬停
+
+速度降至 3 m/s 以下后，逐步抬头建立悬停姿态：
+
+$$\theta_{base} = 45° + \left(1 - \frac{V}{3}\right) \cdot (85° - 45°)$$
+
+油门恢复到 hover_throttle，速度环和高度环恢复全增益，HoverPID 全权控制。
+
+### 5.5 物理约束
+
+**力矩平衡硬约束**：在 $\alpha > 35°$ 时，气动低头力矩（$C_m < 0$）超过升降副翼最大抬头力矩。以 $\alpha = 40°$, $V = 12$ m/s 为例：
+
+$$M_{aero} = C_m \cdot q_{inf} \cdot S \cdot \bar{c} \approx -1.72 \text{ N·m}$$
+$$M_{elevon,max} (30°) \approx +1.40 \text{ N·m}$$
+
+缺口 $-0.32$ N·m，飞机不可控。因此 alpha 必须控制在 25° 以下。
+
+**减速能力限制**：中等迎角下最大减速约 0.1-0.15 m/s²，从 20 m/s 到 0 需 100-150 秒。
+
+---
+
+## 6. 线性化分析
+
+### 6.1 数值雅可比计算
 
 使用中心差分法计算状态矩阵$\mathbf{A}$和控制矩阵$\mathbf{B}$：
 
@@ -375,7 +449,7 @@ $$A_{i,j} = \frac{f(\mathbf{x}_0 + \epsilon\mathbf{e}_j, \mathbf{u}_0) - f(\math
 
 **注意**：当前`linearize_analyze.py`假设12状态（欧拉角）系统，与13状态四元数模型不直接兼容。建议在四元数配平点附近进行小扰动线性化，或导出等效12状态模型后再分析经典模态。
 
-### 5.2 模态分析
+### 6.2 模态分析
 
 #### 纵向模态
 - **短周期模态**：快速俯仰振荡，主导变量$q$和$\theta$
@@ -390,9 +464,9 @@ $$A_{i,j} = \frac{f(\mathbf{x}_0 + \epsilon\mathbf{e}_j, \mathbf{u}_0) - f(\math
 
 ---
 
-## 6. 仿真与控制性能
+## 7. 仿真与控制性能
 
-### 6.1 积分方法（RK4）
+### 7.1 积分方法（RK4）
 
 ```
 k1 = f(t_n, x_n, u_n)
@@ -404,43 +478,52 @@ x_{n+1} = x_n + h/6*(k1 + 2k2 + 2k3 + k4)
 
 每步后重新归一化四元数：$\mathbf{q} = \mathbf{q} / |\mathbf{q}|$。
 
-### 6.2 控制限制
+### 7.2 控制限制
 
-$$|\tilde{\theta}_{pitch}|, |\tilde{\phi}_{roll}| \leq 15° \quad \text{（最大倾斜角）}$$
-$$|\delta e_{left}|, |\delta e_{right}| \leq 20° \quad \text{（最大舵面偏角）}$$
-$$|T_{left}|, |T_{right}| \leq 1.0 \quad \text{（最大油门）}$$
+| 参数 | HoverPID | RecoveryController |
+|------|----------|-------------------|
+| 最大倾斜角 | 15° | — |
+| 最大舵面偏角 | 20° | 30° |
+| 最大油门 | 1.0 | 1.0 |
+| 最大俯仰角速率 | — | 30°/s |
 
 ---
 
-## 7. 实现说明
+## 8. 实现说明
 
-### 7.1 气动数据文件
+### 8.1 气动数据文件
 - `aerodata_lon.xlsx`：纵向气动系数（$\alpha, C_L, C_D, C_m$）
 - `aerodata_lat.xlsx`：横侧向气动系数（$\alpha, \beta, C_Y, C_l, C_n$）
 - `aerodata_de.xlsx`：升降副翼增量系数（$\delta e, \Delta C_L, \Delta C_D, \Delta C_m$）
 - `aerodata_throttle.xlsx`：推力-油门关系
 
-### 7.2 大气模型（ISA）
+### 8.2 大气模型（ISA）
 标准大气模型，计算温度、压力、密度随高度变化。
 
-### 7.3 关键代码文件
-1. `aircraft_6dof.py`：核心动力学模型（13状态四元数、双动压气动、配平）
-2. `hover_pid_controller.py`：悬停级联PID控制器
-3. `hover_simulation.py`：悬停仿真主程序（RK4积分、绘图）
-4. `hover_trim_manual.py`：配平验证
-5. `linearize_analyze.py`：前飞模态分析（需适配四元数状态）
+### 8.3 关键代码文件
+1. `core/aircraft_6dof.py`：核心动力学模型（13状态四元数、双动压气动、配平）
+2. `core/integrator.py`：RK4积分器（四元数归一化、溢出保护）
+3. `controllers/hover_pid_controller.py`：悬停级联PID控制器
+4. `controllers/recovery_controller.py`：三阶段回收控制律
+5. `simulations/recovery_simulation.py`：回收过程仿真主程序
+6. `simulations/hover_simulation.py`：悬停仿真主程序
+7. `analysis/recovery_envelope.py`：减速能力包络线分析
+8. `analysis/linearize_analyze.py`：线性化与模态分析
 
 ---
 
-## 8. 验证清单
+## 9. 验证清单
 
 | 验证项 | 命令 | 期望结果 |
 |--------|------|----------|
-| 配平残差 | `python hover_trim_manual.py` | `max\|dx[0:9]\| < 1e-3` |
-| 悬停稳定性 | `python hover_simulation.py` | 20s内位置误差收敛至 `<0.5m` |
-| 极性验证 | `python test_compute_polarity.py` | 全部通道[OK] |
+| 配平残差 | `python -m analysis.hover_trim_manual` | `max\|dx[0:9]\| < 1e-3` |
+| 悬停稳定性 | `python -m simulations.hover_simulation` | 20s内位置误差收敛至 `<0.5m` |
+| 极性验证 | `python -m tests.test_polarity` | 全部通道[OK] |
 | 四元数归一化 | 检查仿真输出 `norm(q)` | 全程保持 `1.0 ± 1e-6` |
+| 回收 Stage A | `python -m simulations.recovery_simulation` | V 从 20 降至 ~15 m/s，alpha < 20° |
+| 回收 Stage B | 同上 | V 持续下降，alpha < 25° |
+| 回收终点 | 同上 | V < 1 m/s，pz 在 20±2 m |
 
 ---
 
-*本文档基于2026-04-26的代码快照编写。*
+*本文档基于2026-05-16的代码快照编写。*

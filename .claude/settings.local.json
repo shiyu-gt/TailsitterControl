@@ -18,7 +18,9 @@
       "Bash(python -c \"from tests.test_forward_controller import test_case; print\\('test_forward_controller OK'\\)\")",
       "Bash(python -c \"from tests.test_forward_flight import main; print\\('test_forward_flight OK'\\)\")",
       "Bash(python -c \"from analysis.linearize_analyze import full_linearisation; print\\('linearize_analyze OK'\\)\")",
-      "Bash(python -c \"from analysis.hover_trim_manual import manual_hover_trim; print\\('hover_trim_manual OK'\\)\")"
+      "Bash(python -c \"from analysis.hover_trim_manual import manual_hover_trim; print\\('hover_trim_manual OK'\\)\")",
+      "Bash(python -c \"from simulations.recovery_simulation import run_recovery_simulation; run_recovery_simulation\\(dt=0.01, t_end=60.0\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"from analysis.recovery_envelope import run_envelope_analysis; run_envelope_analysis\\(\\)\")"
     ]
   }
 }
